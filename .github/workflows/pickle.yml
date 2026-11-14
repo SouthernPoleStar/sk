@@ -1,0 +1,64 @@
+name: Build pickle image
+
+# The pickle device has no [stock] section: its recovery is made from the
+# stock vendor_boot kept in the repository, not from a published package,
+# so the generic workflow cannot pack it. This one does, and hands the
+# image out as the whole 64 MiB partition it is flashed as.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/**"
+      - "devices/pickle.toml"
+      - "pickle-stock-vendor_boot.img"
+      - "resources/fonts/**"
+      - ".github/workflows/pickle.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pickle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build the recovery for pickle
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Install lz4 and zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lz4 zip
+      - name: Build the packer
+        run: cargo build --locked --release -p skyward-pack
+      - name: Build the recovery service
+        run: cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward
+      - name: Build the second system's first program, static
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward-system-init --target-dir target/system-init
+      - name: Pack the recovery on the stock vendor_boot
+        run: |
+          ./target/release/skyward-pack recovery \
+            --stock pickle-stock-vendor_boot.img \
+            --binary target/aarch64-linux-android/release/skyward \
+            --system-init target/system-init/aarch64-linux-android/release/system-init \
+            --config devices/pickle.toml \
+            --font resources/fonts/MiSansVF.ttf \
+            --mono resources/fonts/KirkMono-Regular.ttf \
+            --mono-license resources/fonts/KirkMono-OFL.txt \
+            --out skyward-pickle-vendor_boot.img
+          sha256sum skyward-pickle-vendor_boot.img
+      - uses: actions/upload-artifact@v7
+        with:
+          name: skyward-pickle-vendor_boot
+          path: skyward-pickle-vendor_boot.img
+          if-no-files-found: error
+          retention-days: 14
