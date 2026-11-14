@@ -1,0 +1,203 @@
+# Skyward 设备配置 —— OnePlus Ace（pickle / PGKM10）
+#
+# 数据来源：原厂 ColorOS 12.1（SP1A.210812.016，ro.oplus.version.base
+# 00.4.00015003.2026040318171036965716）恢复模式的 vendor_boot 镜像
+# vendor_boot_20261111_203114.img（VNDRBOOT v4，64 MiB 分区 dump，含 AVB 尾巴）。
+# 文中「原厂包」均指该镜像解出的 ramdisk。
+#
+# 关键前提：这台机器把 recovery 的根文件系统放在 vendor_boot 里（MTK GKI 布局），
+# 而不是独立的 recovery 分区。证据：ramdisk 内有 init.recovery.mt6895.rc、
+# system/bin/recovery、system/bin/phoenix_recovery、res/OplusOS，且
+# system/etc/init/hw/init.rc 第一行就是 import /init.recovery.${ro.board.platform}.rc。
+# skyward-pack 现在认 VNDRBOOT v4：读到这个头就按 vendor_boot 打包——头、ramdisk
+# 表里的每一个片段、dtbo 段原样保留，换掉装着 recovery 的那一段，再按分区大小
+# 补 AVB 尾巴（见 crates/skyward-bootimg/src/vendorboot.rs）。
+#
+# 本文件里 TODO 的字段，仍需真机或 vendor / vendor_dlkm 分区确认。
+
+[device]
+codename = "pickle"
+brand = "OnePlus"
+model = "OnePlus Ace"
+ab = true
+soc = { hans = "天玑8100-Max移动平台", hant = "天璣8100-Max行動平台", en = "MediaTek Dimensity 8100-Max" }
+# ColorOS 的版本属性。原厂 prop.default 里能看到的只有 ro.oplus.version.base，
+# 若真机上没有 ro.build.version.ota，退回前者。
+os_version_prop = "ro.build.version.ota"
+
+[display]
+width = 1080
+height = 2412
+density = 480        # 原厂 prop.default：ro.sf.lcd_density=480
+diagonal = 6.7
+corner_radius = 0    # TODO 需系统 overlay（DevicesAndroidOverlay）确认，非 0 才要填
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor"]
+# 取自原厂 lib/modules/modules.load.recovery（246 个模块）中显示、触摸、振动部分，
+# 顺序也照它排。依赖由 modules.dep 自动带出（原厂包内有 modules.dep / alias /
+# softdep / load / load.recovery 全套）。
+# 面板驱动照原厂做法全部加载：同一份 vendor_boot 供 ossi 统一包下的多个项目用，
+# 只有实际接上的那颗面板会 probe 成功。
+load = [
+    # 显示：MTK DRM + 面板扩展；面板本体（21641/21861 两组，BOE / 天马）
+    "mtk_panel_ext",
+    "mediatek-drm",   # 文件名带连字符，Skyward 按 "{name}.ko" 找文件，不能写成 mediatek_drm
+    "oplus21641_boe_nt37701_fhd_dsi_cmd",
+    "oplus21641_boe_nt37701a_fhd_dsi_cmd",
+    "oplus21641_tianma_ili7838a_fhd_dsi_cmd",
+    "oplus21861_boe_nt37701a_fhd_dsi_cmd",
+    "oplus21861_tianma_ili7838a_fhd_dsi_cmd",
+    # 触摸：FocalTech FT3683G，原厂按 common → IC → 驱动 三段加载
+    # （触摸工程 omega-c2，面板 alias AC157，固件在 /vendor/firmware/tp/omega-c2）
+    "oplus_bsp_tp_ft3683g",
+    "oplus_ft3683g",
+    # 振动：Awinic AW8697
+    "aw8697",
+    # 电量：MT6375 电池 + OPLUS 充电栈（关于页读电量要用）
+    # 同样注意文件名带连字符：mt6375-battery.ko
+    "mt6375-battery",
+    "oplus_chg_v2",
+]
+
+# 触摸控制器 FT3683G 由内核 input 子系统直接出 /dev/input/eventX，
+# 原厂没有像小米那样再起一个用户态触摸服务，也不需要在读出触摸前写 sysfs。
+[touch]
+
+[backup]
+# MTK 的基带 / IMEI 与校准数据：nvram 与 nvdata 是 IMEI 与射频校准，
+# nvcfg 是配置，protect1/protect2 是出厂保护分区，seccfg 是锁状态，
+# persist 存传感器校准，proinfo 存产品信息（见原厂 recovery.fstab）。
+efs = ["nvram", "nvdata", "nvcfg", "protect1", "protect2", "seccfg", "persist", "proinfo"]
+# TODO 确认 secure world（Trustonic TEE）在 /data 下自管的目录，
+# 常见候选：vendor/tee、vendor/tzstorage、vendor/fingerprint。
+data_skipped = []
+
+[wipe]
+# ColorOS 的日志目录（原厂 recovery 二进制里写死的路径），只清文件、留目录。
+logs = ["/data/oppo_log"]
+# TODO 真机确认是否还有 /data/aee_exp（MTK AEE 转储）与 /data/vendor/ramdump。
+
+# ============================================================================
+# 以下按原厂 vendor / vendor_dlkm 分区（vendor.img、vendor_dlkm_b.img）核对填写。
+# ============================================================================
+
+# Trustonic 的 TEE 守护进程要读 /mnt/vendor/persist/mcRegistry，而 recover
+# 的 fstab（recovery.fstab）里没有 persist，原厂只在 first-stage 的
+# fstab.mt6895 里登记了它，所以 persist 要由 Skyward 自己挂。
+# vendor 与 odm 带 first_stage_mount，原厂 init 起来时已挂好，这里不再重复。
+[partitions]
+mounted = ["persist"]
+
+# WLAN：MT6895 是 connac2 方案，驱动在 vendor_dlkm
+# （conninfra → wlan_drv_gen4m_6895），芯片上电靠写 /dev/wmtWifi
+# （wmt_chrdev_wifi_connac2 建的字符设备，libwifi-hal.so 也是这么做的）。
+# 原厂 supplicant 的参数：-O/data/vendor/wifi/wpa/sockets -g@android:wpa_wlan0
+[wlan]
+modules = ["conninfra", "wlan_drv_gen4m_6895"]
+writes = [{ path = "/dev/wmtWifi", value = "1" }]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/vendor/lib64", "/system/lib64"]
+service = "android.hardware.wifi.supplicant@1.0::ISupplicant/default"
+# 原厂用 https://connectivitycheck.gstatic.com/generate_204（另有 www.google.cn），
+# Skyward 这一项按纯 HTTP 用。
+probe = "http://connectivitycheck.gstatic.com/generate_204"
+
+# 振动器：aw8697 + haptic_hv。该驱动不对外暴露共振频率（f0 只在驱动内部标定），
+# 因此 Skyward 的 [haptics] 段（需要 resonance 文件）暂时填不了。
+# [haptics]
+# resonance = "/sys/class/haptic_hv/f0"
+# strength = { lightest = 0.5, strongest = 1.0 }
+
+# 更新服务器：OPPO/一加 的 OTA 查询接口，需抓包确认
+# [update]
+# server = ""
+
+# 解密链路（顺序即启动顺序）：
+#   hwservicemanager → Trustonic 守护进程 → keymint（AIDL）→ gatekeeper（HIDL）
+# 全部取自原厂 /vendor/etc/init/*.rc。keymint 是 AIDL（NDK backend），
+# 实例名 IKeyMintDevice/default；gatekeeper 是 HIDL 1.0。
+[[service]]
+path = "/system/bin/hwservicemanager"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_property = "hwservicemanager.ready"
+user = "system"
+groups = ["system", "readproc"]
+
+# 原厂：/vendor/bin/mcDriverDaemon --sfs-reformat --P1 /mnt/vendor/persist/mcRegistry -r …
+# 这里去掉了 --sfs-reformat：那是正常开机时重建 TEE 安全文件系统用的，
+# 在恢复模式里跑有清掉 keystore / gatekeeper 状态的风险。
+[[service]]
+path = "/vendor/bin/mcDriverDaemon"
+args = [
+    "--P1", "/mnt/vendor/persist/mcRegistry",
+    "-r", "/vendor/app/mcRegistry/06090000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/020f0000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/05120000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/05120000000000000000000000000001.drbin",
+    "-r", "/vendor/app/mcRegistry/05160000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/020b0000000000000000000000000000.drbin",
+    "-r", "/odm/vendor/app/mcRegistry/05070000000000000000000000000000.drbin",
+    "-r", "/odm/vendor/app/mcRegistry/030b0000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/03100000000000000000000000000000.drbin",
+    "-r", "/odm/vendor/app/mcRegistry/030c0000000000000000000000000000.drbin",
+    "-r", "/odm/vendor/app/mcRegistry/031c0000000000000000000000000000.drbin",
+    "-r", "/odm/vendor/app/mcRegistry/033c0000000000000000000000000000.drbin",
+    "-r", "/odm/vendor/app/mcRegistry/035c0000000000000000000000000000.drbin",
+    "-r", "/odm/vendor/app/mcRegistry/037c0000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/031c0000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/032c0000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/033c0000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/034c0000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/035c0000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/036c0000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/037c0000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/40188311faf343488db888ad39496f9a.drbin",
+    "-r", "/vendor/app/mcRegistry/090b0000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/0f5eed3c3b5a47afacca69a84bf0efad.drbin",
+    "-r", "/vendor/app/mcRegistry/07060000000000000000000000007169.drbin",
+    "-r", "/vendor/app/mcRegistry/4be4f7dc1f2c11e5b5f7727283247c7f.drbin",
+    "-r", "/vendor/app/mcRegistry/08070000000000000000000000008270.drbin",
+    "-r", "/vendor/app/mcRegistry/07070000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/07407000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/9073f03a9618383bb1856eb3f990babd.drbin",
+    "-r", "/odm/vendor/app/mcRegistry/6b3f5fa0f8cf55a7be2582587d62d63a.drbin",
+    "-r", "/odm/vendor/app/mcRegistry/09070000000000000000000000000000.drbin",
+    "-r", "/vendor/app/mcRegistry/5020170115e016302017012521300000.drbin",
+]
+user = "system"
+groups = ["system"]
+
+# Trustonic 的 keymint：AIDL（ndk backend），原厂 rc 里 class early_hal、user system
+[[service]]
+path = "/vendor/bin/hw/android.hardware.security.keymint-service.trustonic"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
+registers = ["android.hardware.security.keymint.IRemotelyProvisionedComponent/default"]
+user = "system"
+groups = ["system"]
+
+# gatekeeper：HIDL 1.0，原厂 rc 里 user system / group system
+[[service]]
+path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
+user = "system"
+groups = ["system"]
+
+# 原厂 ramdisk 自带的那份 boot control（HIDL 1.2），写当前槽位用
+[[service]]
+path = "/vendor/bin/hw/android.hardware.boot@1.2-service"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_hardware_service = "android.hardware.boot@1.2::IBootControl/default"
+user = "root"
+groups = ["root"]
+
+
+# 原厂构建：Skyward 要以原厂包为底改。本机恢复镜像就是 vendor_boot，
+# 下面给出这个 dump 的版本与 SHA-256；换成 OTA 包里的 vendor_boot.img 时需重算。
+# [stock]
+# version = "00.4.00015003.2026040318171036965716"   # ro.oplus.version.base
+# package = ""                                        # TODO 原厂完整 OTA 包地址
+# recovery = "bb5a094de2f3396b9be3b20354d637092ef57d1355413b784cd863f222839670"

@@ -1,0 +1,1290 @@
+diff --git a/crates/skyward-block/src/fstab.rs b/crates/skyward-block/src/fstab.rs
+index f75cbad..76c903a 100644
+--- a/crates/skyward-block/src/fstab.rs
++++ b/crates/skyward-block/src/fstab.rs
+@@ -4,9 +4,38 @@
+ use anyhow::{Context, Result};
+ use std::path::{Path, PathBuf};
+ 
+-/// Where the phone's own partitions keep the table.
++/// Where the phone's own partitions keep the table: the files Qualcomm
++/// phones use, and whatever `fstab.*` the folders holding such a table
++/// have, which is how MediaTek phones name theirs (fstab.mt6895, kept in
++/// the first-stage ramdisk as well as on the vendor partition).
+ pub const FILES: [&str; 2] = ["/vendor/etc/fstab.qcom", "/odm/etc/fstab.qcom"];
+ 
++/// The folders a phone keeps a table in.
++const FOLDERS: [&str; 4] = ["/vendor/etc", "/odm/etc", "/first_stage_ramdisk", "/etc"];
++
++/// Every table the phone keeps, read from wherever one is.
++fn files() -> Vec<PathBuf> {
++    let mut out: Vec<PathBuf> = FILES.iter().map(PathBuf::from).collect();
++    for folder in FOLDERS {
++        let entries = match std::fs::read_dir(folder) {
++            Ok(entries) => entries,
++            Err(_) => continue,
++        };
++        let mut found: Vec<PathBuf> = entries
++            .flatten()
++            .map(|e| e.path())
++            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("fstab.")))
++            .collect();
++        found.sort();
++        for path in found {
++            if !out.contains(&path) {
++                out.push(path);
++            }
++        }
++    }
++    out
++}
++
+ /// One filesystem the phone knows about.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Entry {
+@@ -54,11 +83,11 @@ pub fn entries(text: &str) -> Vec<Entry> {
+ /// Every entry of the phone's own table, read from wherever the table is.
+ fn table() -> Result<Vec<Entry>> {
+     let mut out = Vec::new();
+-    for file in FILES {
+-        let text = match std::fs::read_to_string(file) {
++    for file in files() {
++        let text = match std::fs::read_to_string(&file) {
+             Ok(text) => text,
+             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+-            Err(e) => return Err(e).with_context(|| format!("read {file}")),
++            Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
+         };
+         out.extend(entries(&text));
+     }
+diff --git a/crates/skyward-bootimg/src/lib.rs b/crates/skyward-bootimg/src/lib.rs
+index b35dff4..0607944 100644
+--- a/crates/skyward-bootimg/src/lib.rs
++++ b/crates/skyward-bootimg/src/lib.rs
+@@ -1,9 +1,13 @@
+-//! Android boot images with header version 3 or 4, and the newc archives
+-//! their ramdisks are: read, changed and written again, by the image packer
+-//! on a computer and by the recovery on the phone.
++//! Android boot images with header version 3 or 4, the vendor_boot images
++//! whose ramdisk holds a recovery on phones that keep it out of a partition
++//! of its own, and the newc archives the ramdisks are: read, changed and
++//! written again, by the image packer on a computer and by the recovery on
++//! the phone.
+ 
+ mod image;
+ mod ramdisk;
++mod vendorboot;
+ 
+ pub use image::BootImage;
+ pub use ramdisk::{lz4_legacy, Entry, Ramdisk};
++pub use vendorboot::{is_vendor_boot, Fragment, VendorBoot};
+diff --git a/crates/skyward-bootimg/src/vendorboot.rs b/crates/skyward-bootimg/src/vendorboot.rs
+new file mode 100644
+index 0000000..fd7a627
+--- /dev/null
++++ b/crates/skyward-bootimg/src/vendorboot.rs
+@@ -0,0 +1,301 @@
++//! `vendor_boot` images, header version 3 or 4: on phones that keep their
++//! recovery out of a `recovery` partition, the ramdisk that holds it and the
++//! device tree the bootloader hands the kernel are here, and there is no
++//! kernel of the image's own.
++//!
++//! The image is a header, the ramdisk (in version 4, as many fragments as its
++//! table names), the device tree, that table and the boot config, each of
++//! them starting on a page boundary.
++
++use anyhow::{bail, ensure, Context, Result};
++use std::fs;
++use std::path::Path;
++
++/// What a vendor_boot image starts with.
++pub const MAGIC: &[u8; 8] = b"VNDRBOOT";
++
++const CMDLINE_LEN: usize = 2048;
++const NAME_LEN: usize = 16;
++const ENTRY_NAME_LEN: usize = 32;
++const BOARD_ID: usize = 16;
++/// The fields of one table entry: its size, offset and type, its name and
++/// the board IDs it is for.
++const ENTRY_LEN: usize = 12 + ENTRY_NAME_LEN + BOARD_ID * 4;
++
++/// One ramdisk of a version 4 image: the bootloader loads each where the
++/// table says, and the kernel unpacks them one after another.
++#[derive(Clone)]
++pub struct Fragment {
++    pub name: String,
++    /// What the fragment holds: 1 the platform's, 2 the recovery's, 3 a
++    /// vendor dlkm's.
++    pub kind: u32,
++    pub board_id: [u32; BOARD_ID],
++    pub data: Vec<u8>,
++}
++
++/// A vendor_boot image split into its header, ramdisks, device tree and boot
++/// config.
++pub struct VendorBoot {
++    pub header_version: u32,
++    pub page_size: u32,
++    pub kernel_addr: u32,
++    pub ramdisk_addr: u32,
++    /// The kernel command line the bootloader adds to its own.
++    pub cmdline: Vec<u8>,
++    pub tags_addr: u32,
++    pub name: Vec<u8>,
++    pub dtb_addr: u64,
++    pub fragments: Vec<Fragment>,
++    pub dtb: Vec<u8>,
++    pub bootconfig: Vec<u8>,
++}
++
++/// Whether `bytes` start a vendor_boot image.
++pub fn is_vendor_boot(bytes: &[u8]) -> bool {
++    bytes.len() >= MAGIC.len() && &bytes[..MAGIC.len()] == MAGIC
++}
++
++fn u32_at(bytes: &[u8], at: usize) -> Result<u32> {
++    let b = bytes.get(at..at + 4).with_context(|| format!("the header ends before {at}"))?;
++    Ok(u32::from_le_bytes(b.try_into().expect("four bytes")))
++}
++
++fn u64_at(bytes: &[u8], at: usize) -> Result<u64> {
++    let b = bytes.get(at..at + 8).with_context(|| format!("the header ends before {at}"))?;
++    Ok(u64::from_le_bytes(b.try_into().expect("eight bytes")))
++}
++
++fn section(bytes: &[u8], at: usize, len: usize, what: &str) -> Result<Vec<u8>> {
++    let end = at.checked_add(len).with_context(|| format!("{what} runs past the end of the image"))?;
++    bytes.get(at..end).map(<[u8]>::to_vec).ok_or_else(|| anyhow::anyhow!("{what} runs past the end of the image"))
++}
++
++/// A header field of `len` bytes, ending where its NUL does.
++fn field(bytes: &[u8], at: usize, len: usize, what: &str) -> Result<Vec<u8>> {
++    let field = section(bytes, at, len, what)?;
++    Ok(field.split(|b| *b == 0).next().unwrap_or_default().to_vec())
++}
++
++fn aligned(at: usize, page: usize) -> usize {
++    at.div_ceil(page) * page
++}
++
++impl VendorBoot {
++    pub fn read(path: &Path) -> Result<Self> {
++        let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
++        VendorBoot::parse(&bytes).with_context(|| format!("read {}", path.display()))
++    }
++
++    /// The image `bytes` hold, as a partition holds it: the image, its
++    /// vbmeta image and the footer after it are left alone.
++    pub fn parse(bytes: &[u8]) -> Result<Self> {
++        ensure!(is_vendor_boot(bytes), "it does not start with {}", String::from_utf8_lossy(MAGIC));
++        let header_version = u32_at(bytes, 8)?;
++        ensure!((3..=4).contains(&header_version), "header version {header_version} is not one a vendor_boot image has");
++        let page_size = u32_at(bytes, 12)?;
++        ensure!(page_size.is_power_of_two(), "a page of {page_size} bytes is no page");
++        let page = page_size as usize;
++        let kernel_addr = u32_at(bytes, 16)?;
++        let ramdisk_addr = u32_at(bytes, 20)?;
++        let ramdisk_size = u32_at(bytes, 24)? as usize;
++        let cmdline = field(bytes, 28, CMDLINE_LEN, "the command line")?;
++        let tags_addr = u32_at(bytes, 28 + CMDLINE_LEN)?;
++        let name = field(bytes, 28 + CMDLINE_LEN + 4, NAME_LEN, "the name")?;
++        let header_size = u32_at(bytes, 2096)?;
++        ensure!(
++            header_size as usize == if header_version == 4 { 2128 } else { 2112 },
++            "a version {header_version} header of {header_size} bytes"
++        );
++        let dtb_size = u32_at(bytes, 2100)? as usize;
++        let dtb_addr = u64_at(bytes, 2104)?;
++
++        let ramdisk_at = page;
++        let dtb_at = aligned(ramdisk_at + ramdisk_size, page);
++        let dtb = section(bytes, dtb_at, dtb_size, "the device tree")?;
++
++        if header_version == 3 {
++            let data = section(bytes, ramdisk_at, ramdisk_size, "the ramdisk")?;
++            return Ok(VendorBoot {
++                header_version,
++                page_size,
++                kernel_addr,
++                ramdisk_addr,
++                cmdline,
++                tags_addr,
++                name,
++                dtb_addr,
++                fragments: vec![Fragment { name: String::new(), kind: 1, board_id: [0; BOARD_ID], data }],
++                dtb,
++                bootconfig: Vec::new(),
++            });
++        }
++
++        let table_size = u32_at(bytes, 2112)? as usize;
++        let table_num = u32_at(bytes, 2116)? as usize;
++        let entry_size = u32_at(bytes, 2120)? as usize;
++        let bootconfig_size = u32_at(bytes, 2124)? as usize;
++        ensure!(entry_size == ENTRY_LEN, "table entries of {entry_size} bytes are not the {ENTRY_LEN} there are");
++        ensure!(table_size >= table_num * entry_size, "a table of {table_size} bytes holds no {table_num} entries");
++
++        let table_at = aligned(dtb_at + dtb_size, page);
++        let table = section(bytes, table_at, table_size, "the ramdisk table")?;
++        let mut fragments = Vec::with_capacity(table_num);
++        for i in 0..table_num {
++            let e = &table[i * entry_size..(i + 1) * entry_size];
++            let size = u32::from_le_bytes(e[0..4].try_into().expect("four bytes")) as usize;
++            let offset = u32::from_le_bytes(e[4..8].try_into().expect("four bytes")) as usize;
++            let kind = u32::from_le_bytes(e[8..12].try_into().expect("four bytes"));
++            let name = e[12..12 + ENTRY_NAME_LEN].split(|b| *b == 0).next().unwrap_or_default();
++            let name = String::from_utf8_lossy(name).into_owned();
++            let mut board_id = [0u32; BOARD_ID];
++            for (j, id) in board_id.iter_mut().enumerate() {
++                let at = 12 + ENTRY_NAME_LEN + j * 4;
++                *id = u32::from_le_bytes(e[at..at + 4].try_into().expect("four bytes"));
++            }
++            let data = section(bytes, ramdisk_at + offset, size, &format!("ramdisk {name:?}"))?;
++            fragments.push(Fragment { name, kind, board_id, data });
++        }
++
++        let bootconfig_at = aligned(table_at + table_size, page);
++        let bootconfig = section(bytes, bootconfig_at, bootconfig_size, "the boot config")?;
++
++        Ok(VendorBoot { header_version, page_size, kernel_addr, ramdisk_addr, cmdline, tags_addr, name, dtb_addr, fragments, dtb, bootconfig })
++    }
++
++    /// The image with sizes and offsets taken from its parts: a version 4
++    /// header keeps its version and table, a version 3 one its single
++    /// ramdisk.
++    pub fn to_bytes(&self) -> Result<Vec<u8>> {
++        let page = self.page_size as usize;
++        let ramdisk_size: usize = self.fragments.iter().map(|f| f.data.len()).sum();
++        let header_len = if self.header_version == 4 { 2128 } else { 2112 };
++        let mut out = vec![0u8; page];
++        out[..8].copy_from_slice(MAGIC);
++        out[8..12].copy_from_slice(&self.header_version.to_le_bytes());
++        out[12..16].copy_from_slice(&self.page_size.to_le_bytes());
++        out[16..20].copy_from_slice(&self.kernel_addr.to_le_bytes());
++        out[20..24].copy_from_slice(&self.ramdisk_addr.to_le_bytes());
++        let ramdisk_len = u32::try_from(ramdisk_size).context("the ramdisk is too large")?;
++        out[24..28].copy_from_slice(&ramdisk_len.to_le_bytes());
++        out[28..28 + CMDLINE_LEN].copy_from_slice(&padded(&self.cmdline, CMDLINE_LEN, "the command line")?);
++        out[28 + CMDLINE_LEN..32 + CMDLINE_LEN].copy_from_slice(&self.tags_addr.to_le_bytes());
++        out[32 + CMDLINE_LEN..32 + CMDLINE_LEN + NAME_LEN].copy_from_slice(&padded(&self.name, NAME_LEN, "the name")?);
++        out[2096..2100].copy_from_slice(&(header_len as u32).to_le_bytes());
++        let dtb_len = u32::try_from(self.dtb.len()).context("the device tree is too large")?;
++        out[2100..2104].copy_from_slice(&dtb_len.to_le_bytes());
++        out[2104..2112].copy_from_slice(&self.dtb_addr.to_le_bytes());
++        if self.header_version == 4 {
++            let entry_len = u32::try_from(ENTRY_LEN).context("table entry")?;
++            let table_len = u32::try_from(self.fragments.len() * ENTRY_LEN).context("the table is too large")?;
++            out[2112..2116].copy_from_slice(&table_len.to_le_bytes());
++            out[2116..2120].copy_from_slice(&(self.fragments.len() as u32).to_le_bytes());
++            out[2120..2124].copy_from_slice(&entry_len.to_le_bytes());
++            let bootconfig_len = u32::try_from(self.bootconfig.len()).context("the boot config is too large")?;
++            out[2124..2128].copy_from_slice(&bootconfig_len.to_le_bytes());
++        }
++        out.resize(page, 0);
++
++        let mut offsets = Vec::with_capacity(self.fragments.len());
++        for f in &self.fragments {
++            offsets.push(u32::try_from(out.len() - page).context("a ramdisk offset")?);
++            out.extend_from_slice(&f.data);
++        }
++        out.resize(aligned(out.len(), page), 0);
++        out.extend_from_slice(&self.dtb);
++        out.resize(aligned(out.len(), page), 0);
++
++        if self.header_version == 4 {
++            for (f, offset) in self.fragments.iter().zip(&offsets) {
++                let at = out.len();
++                out.resize(at + ENTRY_LEN, 0);
++                let e = &mut out[at..];
++                e[0..4].copy_from_slice(&(f.data.len() as u32).to_le_bytes());
++                e[4..8].copy_from_slice(&offset.to_le_bytes());
++                e[8..12].copy_from_slice(&f.kind.to_le_bytes());
++                let name = f.name.as_bytes();
++                ensure!(name.len() <= ENTRY_NAME_LEN, "a ramdisk name of {} bytes", name.len());
++                e[12..12 + name.len()].copy_from_slice(name);
++                for (j, id) in f.board_id.iter().enumerate() {
++                    let at = 12 + ENTRY_NAME_LEN + j * 4;
++                    e[at..at + 4].copy_from_slice(&id.to_le_bytes());
++                }
++            }
++            out.resize(aligned(out.len(), page), 0);
++            out.extend_from_slice(&self.bootconfig);
++            out.resize(aligned(out.len(), page), 0);
++        }
++        Ok(out)
++    }
++}
++
++/// `value` in a field of `len` bytes, zero-filled after it.
++fn padded(value: &[u8], len: usize, what: &str) -> Result<Vec<u8>> {
++    if value.len() > len {
++        bail!("{what} takes more than {len} bytes");
++    }
++    let mut out = vec![0u8; len];
++    out[..value.len()].copy_from_slice(value);
++    Ok(out)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn image(header_version: u32) -> VendorBoot {
++        let mut board_id = [0u32; BOARD_ID];
++        board_id[0] = 0x1234;
++        VendorBoot {
++            header_version,
++            page_size: 4096,
++            kernel_addr: 0x8000_0000,
++            ramdisk_addr: 0x66f0_0000,
++            cmdline: b"bootopt=64S3,32N2,64N2".to_vec(),
++            tags_addr: 0x8000_0100,
++            name: b"pickle".to_vec(),
++            dtb_addr: 0x47c8_0000,
++            fragments: vec![
++                Fragment { name: "platform".into(), kind: 1, board_id: [0; BOARD_ID], data: vec![b'P'; 5000] },
++                Fragment { name: "recovery".into(), kind: 2, board_id, data: vec![b'R'; 3000] },
++            ],
++            dtb: vec![b'D'; 700],
++            bootconfig: b"androidboot.foo=1\n".to_vec(),
++        }
++    }
++
++    #[test]
++    fn a_version_4_image_keeps_its_fragments_their_table_and_boot_config() {
++        let packed = image(4).to_bytes().unwrap();
++        let back = VendorBoot::parse(&packed).unwrap();
++        assert_eq!((back.header_version, back.page_size, back.dtb_addr), (4, 4096, 0x47c8_0000));
++        assert_eq!(back.cmdline, image(4).cmdline);
++        assert_eq!(back.fragments.len(), 2);
++        assert_eq!(back.fragments[1].name, "recovery");
++        assert_eq!(back.fragments[1].kind, 2);
++        assert_eq!(back.fragments[1].board_id[0], 0x1234, "the board IDs are kept");
++        assert!(back.fragments[0].data.iter().all(|b| *b == b'P'));
++        assert_eq!(back.dtb, vec![b'D'; 700]);
++        assert_eq!(back.bootconfig, b"androidboot.foo=1\n");
++        assert_eq!(packed.len() % 4096, 0, "the image ends on a page");
++    }
++
++    #[test]
++    fn a_version_3_image_carries_one_ramdisk_and_no_table() {
++        let mut img = image(3);
++        img.fragments.truncate(1);
++        let packed = img.to_bytes().unwrap();
++        assert_eq!(packed.len(), 4096 + 8192 + 4096, "header, one page of ramdisk and the device tree");
++        let back = VendorBoot::parse(&packed).unwrap();
++        assert_eq!(back.fragments.len(), 1);
++        assert_eq!(back.fragments[0].data.len(), 5000);
++        assert!(back.bootconfig.is_empty());
++    }
++
++    #[test]
++    fn bytes_that_are_no_vendor_boot_image_are_refused() {
++        assert!(VendorBoot::parse(b"ANDROID!....................").is_err());
++        assert!(!is_vendor_boot(b"ANDROID!"));
++        assert!(is_vendor_boot(b"VNDRBOOT"));
++    }
++}
+diff --git a/crates/skyward-pack/src/main.rs b/crates/skyward-pack/src/main.rs
+index f76770d..d010e2d 100644
+--- a/crates/skyward-pack/src/main.rs
++++ b/crates/skyward-pack/src/main.rs
+@@ -1,4 +1,4 @@
+-use anyhow::{ensure, Context, Result};
++use anyhow::{bail, ensure, Context, Result};
+ use clap::{Parser, Subcommand};
+ use sha2::{Digest, Sha256};
+ use skyward_config::ramdisk as paths;
+@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
+ 
+ mod avb;
+ 
+-use skyward_bootimg::{BootImage, Ramdisk};
++use skyward_bootimg::{BootImage, Ramdisk, VendorBoot};
+ 
+ /// Builds Skyward recovery images from a device's own stock images.
+ #[derive(Parser)]
+@@ -107,50 +107,34 @@ fn main() -> Result<()> {
+         }
+         Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
+             let size = partition_size(&stock)?;
+-            let mut img = BootImage::read(&stock)?;
+-            let mut rd = Ramdisk::decode(&img.ramdisk)?;
+-            // A stock recovery ramdisk has no third-party tree; refuse to build
+-            // on top of another custom recovery.
+-            if let Some(e) = rd.entries.iter().find(|e| e.name == "FFiles" || e.name.starts_with("twres")) {
+-                anyhow::bail!("{} holds {}, which is not a stock recovery", stock.display(), e.name);
+-            }
+-            let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
++            let build = Build { binary: &binary, system_init: &system_init, config: &config, font: &font, mono: &mono, mono_license: &mono_license };
+             skyward_config::DeviceConfig::load(&config)?;
+-            rd.replace(paths::RECOVERY, read(&binary)?)?;
+-            // Install scripts look for the commands a stock recovery lacks
+-            // among its programs, and its unzip there too, a link to ziptool
+-            // until it points here; the recovery binary is each of them.
+-            let (_, recovery) = paths::RECOVERY.rsplit_once('/').expect("the recovery binary is in a folder");
+-            for command in paths::COMMANDS {
+-                rd.link(command, recovery)?;
+-            }
+-            rd.add(paths::SYSTEM_INIT, 0o755, read(&system_init)?)?;
+-            rd.add(paths::CONFIG, 0o644, read(&config)?)?;
+-            rd.add(paths::FONT, 0o644, read(&font)?)?;
+-            rd.add(paths::MONO, 0o644, read(&mono)?)?;
+-            rd.add(paths::MONO_LICENSE, 0o644, read(&mono_license)?)?;
+-            // A stock ramdisk may run logd without any scheduling profiles,
+-            // and logd stops as soon as it cannot find the one it asks for.
+-            if rd.find(paths::TASK_PROFILES).is_none() {
+-                rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
++            if starts_with(&stock, b"VNDRBOOT")? {
++                // A phone that keeps its recovery root in vendor_boot has no
++                // recovery partition to fill: the stock image is the whole
++                // vendor_boot partition, and the ramdisk among its fragments
++                // is that root.
++                let mut img = VendorBoot::read(&stock)?;
++                let (at, rd) = img
++                    .fragments
++                    .iter()
++                    .enumerate()
++                    .find_map(|(i, f)| Ramdisk::decode(&f.data).ok().map(|rd| (i, rd)))
++                    .with_context(|| format!("no ramdisk in {} unpacks", stock.display()))?;
++                ensure!(rd.find(paths::RECOVERY).is_some(), "the ramdisk in {} holds no {}", stock.display(), paths::RECOVERY);
++                let rd = skyward_on(rd, &build).with_context(|| format!("build on {}", stock.display()))?;
++                img.fragments[at].data = rd.encode()?;
++                let bytes = img.to_bytes()?;
++                let ramdisk: usize = img.fragments.iter().map(|f| f.data.len()).sum();
++                let image = avb::footed(&bytes, "vendor_boot", size, &Sha256::digest(&bytes))?;
++                write_raw(&out, &image, &format!("header and {ramdisk} bytes ramdisk, {} bytes in all", image.len()))
++            } else {
++                let mut img = BootImage::read(&stock)?;
++                let rd = skyward_on(Ramdisk::decode(&img.ramdisk)?, &build).with_context(|| format!("build on {}", stock.display()))?;
++                img.ramdisk = rd.encode()?;
++                let bytes = img.to_bytes()?;
++                write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
+             }
+-            rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+-            // On an unlocked device adbd keeps root when ro.secure is 0 and
+-            // lets any computer in without authorization when ro.adb.secure is
+-            // 0; init lets a later line of a property file override an earlier
+-            // one. update_engine refuses a package built before the recovery
+-            // itself unless both of the last two are set; the recovery checks
+-            // packages against the installed system instead.
+-            let stock_props = &rd
+-                .find(paths::PROP_DEFAULT)
+-                .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
+-                .data;
+-            let mut props = without(stock_props, &BUILD_VERSION);
+-            props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+-            rd.replace(paths::PROP_DEFAULT, props)?;
+-            img.ramdisk = rd.encode()?;
+-            let bytes = img.to_bytes()?;
+-            write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
+         }
+         Cmd::Stock { config, out } => {
+             let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
+@@ -163,6 +147,94 @@ fn main() -> Result<()> {
+     }
+ }
+ 
++/// What a recovery image is made from beyond the device's stock ramdisk.
++struct Build<'a> {
++    binary: &'a PathBuf,
++    system_init: &'a PathBuf,
++    config: &'a PathBuf,
++    font: &'a PathBuf,
++    mono: &'a PathBuf,
++    mono_license: &'a PathBuf,
++}
++
++/// The stock recovery ramdisk with Skyward in the recovery service's place:
++/// its commands, its first-boot program, its configuration, its typefaces,
++/// and the properties its programs read.
++fn skyward_on(mut rd: Ramdisk, build: &Build) -> Result<Ramdisk> {
++    // A stock recovery ramdisk has no third-party tree; refuse to build
++    // on top of another custom recovery.
++    if let Some(e) = rd.entries.iter().find(|e| e.name == "FFiles" || e.name.starts_with("twres")) {
++        bail!("the ramdisk holds {}, which is not a stock recovery", e.name);
++    }
++    let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
++    // The phone's own recovery stays beside Skyward's: when Skyward's screen
++    // cannot come on, it hands the phone over to that one, so an unlit
++    // screen is still a recovery rather than a dark phone.
++    let stock_recovery = rd.find(paths::RECOVERY).map(|e| e.data.clone());
++    rd.replace(paths::RECOVERY, read(build.binary)?)?;
++    if let Some(data) = stock_recovery {
++        rd.add(STOCK_RECOVERY, 0o755, data)?;
++    }
++    // Install scripts look for the commands a stock recovery lacks
++    // among its programs, and its unzip there too, a link to ziptool
++    // until it points here; the recovery binary is each of them.
++    let (_, recovery) = paths::RECOVERY.rsplit_once('/').expect("the recovery binary is in a folder");
++    for command in paths::COMMANDS {
++        rd.link(command, recovery)?;
++    }
++    rd.add(paths::SYSTEM_INIT, 0o755, read(build.system_init)?)?;
++    rd.add(paths::CONFIG, 0o644, read(build.config)?)?;
++    rd.add(paths::FONT, 0o644, read(build.font)?)?;
++    rd.add(paths::MONO, 0o644, read(build.mono)?)?;
++    rd.add(paths::MONO_LICENSE, 0o644, read(build.mono_license)?)?;
++    // A stock ramdisk may run logd without any scheduling profiles,
++    // and logd stops as soon as it cannot find the one it asks for.
++    if rd.find(paths::TASK_PROFILES).is_none() {
++        rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
++    }
++    rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
++    // On an unlocked device adbd keeps root when ro.secure is 0 and
++    // lets any computer in without authorization when ro.adb.secure is
++    // 0; init keeps the first line it reads for a name, so the stock
++    // lines are taken out rather than overridden by the ones below.
++    // update_engine refuses a package built before the recovery
++    // itself unless both of the last two are set; the recovery checks
++    // packages against the installed system instead.
++    let stock_props = &rd
++        .find(paths::PROP_DEFAULT)
++        .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
++        .data;
++    let mut props = without(stock_props, &BUILD_VERSION);
++    props = without(&props, &ADBD);
++    props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
++    rd.replace(paths::PROP_DEFAULT, props)?;
++    // init starts the recovery service again the moment it ends, and a
++    // recovery that ends as it comes up — with a panic, or a fault in the
++    // display — would be started again and again, taking the port down
++    // with every start. Started once, the phone keeps what the last start
++    // left it: a port to reach it by, and a screen that says what it can.
++    once(&mut rd)?;
++    Ok(rd)
++}
++
++/// Whether `path` starts with `magic`.
++fn starts_with(path: &Path, magic: &[u8]) -> Result<bool> {
++    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
++    let mut head = vec![0u8; magic.len()];
++    match file.read_exact(&mut head) {
++        Ok(()) => Ok(head == magic),
++        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
++        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
++    }
++}
++
++/// Write `bytes` to `out`, saying what the image holds.
++fn write_raw(out: &Path, bytes: &[u8], note: &str) -> Result<()> {
++    std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
++    println!("wrote {} ({note})", out.display());
++    Ok(())
++}
++
+ /// The partition a recovery is made on, as a full update package names it.
+ const RECOVERY: &str = "recovery";
+ 
+@@ -221,6 +293,19 @@ fn partition_size(stock: &Path) -> Result<usize> {
+ /// fill in from the installed system once it has that mounted.
+ const BUILD_VERSION: [&str; 3] = ["ro.build.version.release", "ro.build.version.security_patch", "ro.vendor.build.security_patch"];
+ 
++/// Where the recovery the ramdisk came with is kept, beside Skyward's.
++const STOCK_RECOVERY: &str = "system/bin/recovery.stock";
++
++/// The ramdisk's own init rules, in the places a recovery keeps them: at
++/// the root, as Android's recovery ramdisk does, or under the system.
++const INIT_RC: [&str; 2] = ["init.rc", "system/etc/init/hw/init.rc"];
++
++/// The properties that decide whether adbd runs as root and whether a
++/// computer may attach without being authorized. A stock property file may
++/// set them before the ones Skyward writes, and init keeps the first it
++/// reads for a name, so they are taken out first.
++const ADBD: [&str; 3] = ["ro.secure", "ro.adb.secure", "ro.debuggable"];
++
+ /// The scheduling profiles a recovery's programs look up by name. A
+ /// recovery's cgroup setup mounts no controllers, so of all a system's
+ /// profiles do, only the timer slack applies here.
+@@ -230,6 +315,36 @@ const TASK_PROFILES: &[u8] = include_bytes!("task_profiles.json");
+ /// stock recovery does not offer.
+ const MTP_RC: &[u8] = include_bytes!("mtp.rc");
+ 
++/// Declare the recovery service as one init starts once, in whichever of
++/// the ramdisk's own init rules declares it. A stock one declares it
++/// without `oneshot`, so init starts it again as soon as it ends.
++fn once(rd: &mut Ramdisk) -> Result<()> {
++    for path in INIT_RC {
++        let Some(entry) = rd.find(path) else { continue };
++        let text = String::from_utf8_lossy(&entry.data);
++        let mut out = String::with_capacity(text.len() + 16);
++        let mut ours = false;
++        for line in text.lines() {
++            out.push_str(line);
++            out.push('\n');
++            let t = line.trim_start();
++            if t.starts_with("service ") {
++                ours = t.split_whitespace().nth(1) == Some("recovery");
++                continue;
++            }
++            if ours && t.starts_with("oneshot") {
++                ours = false;
++            } else if ours && !t.is_empty() && !t.starts_with('#') {
++                out.push_str("    oneshot\n");
++                ours = false;
++            }
++        }
++        rd.replace(path, out.into_bytes())?;
++        return Ok(());
++    }
++    Ok(())
++}
++
+ /// A property file without the lines that set any of `names`.
+ fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
+     let mut out = Vec::with_capacity(props.len());
+diff --git a/crates/skyward-sys/src/lib.rs b/crates/skyward-sys/src/lib.rs
+index fc11ddf..dd1e290 100644
+--- a/crates/skyward-sys/src/lib.rs
++++ b/crates/skyward-sys/src/lib.rs
+@@ -1,4 +1,4 @@
+-use anyhow::{anyhow, bail, Context, Result};
++use anyhow::{bail, Context, Result};
+ use std::fs::{File, OpenOptions};
+ use std::io::Write;
+ use std::path::Path;
+@@ -171,26 +171,38 @@ pub const RUN: &str = "/skyward/run";
+ /// for as long as the phone stays in recovery.
+ pub const LOG: &str = "/skyward/run/recovery.log";
+ 
+-/// The file [`kmsg`] writes its lines to as well, once [`keep_log`] opened
+-/// it.
+-static KEPT: OnceLock<Mutex<File>> = OnceLock::new();
++/// The files [`kmsg`] writes its lines to as well, once [`keep_log`] opened
++/// them: the one in the ramdisk, which goes with the next start, and one on
++/// a partition that keeps it.
++static KEPT: OnceLock<Mutex<Vec<File>>> = OnceLock::new();
+ 
+ /// Keep every line [`kmsg`] writes from now on in the file at `path` as
+-/// well, after what an earlier run left there.
++/// well, after what an earlier run left there. More than one file may be
++/// kept: a line that outlives the start has to be written twice.
+ pub fn keep_log(path: &Path) -> Result<()> {
+     let file = OpenOptions::new().create(true).append(true).open(path).with_context(|| format!("open {}", path.display()))?;
+-    KEPT.set(Mutex::new(file)).map_err(|_| anyhow!("the log is kept in a file already"))
++    match KEPT.get() {
++        Some(kept) => kept.lock().expect("nothing panics while writing the log").push(file),
++        None => {
++            let _ = KEPT.set(Mutex::new(vec![file]));
++        }
++    }
++    Ok(())
+ }
+ 
+ /// Append a line to the kernel log, where it survives until the next boot
+-/// and shows in `dmesg`, and to the file [`keep_log`] opened, stamped with
+-/// the seconds since the phone started as the kernel log stamps it.
++/// and shows in `dmesg`, and to the files [`keep_log`] opened, stamped with
++/// the seconds since the phone started as the kernel log stamps it. A line
++/// that cannot be written nowhere is not worth ending the recovery for.
+ pub fn kmsg(line: &str) -> Result<()> {
+     let mut f = OpenOptions::new().write(true).open("/dev/kmsg")?;
+     f.write_all(format!("<6>skyward: {line}\n").as_bytes())?;
+     if let Some(kept) = KEPT.get() {
++        let stamp = since_boot().map(|d| d.as_secs_f64()).unwrap_or_default();
+         let mut kept = kept.lock().expect("nothing panics while writing the log");
+-        writeln!(kept, "[{:>12.6}] {line}", since_boot()?.as_secs_f64()).with_context(|| format!("write {LOG}"))?;
++        for file in kept.iter_mut() {
++            let _ = writeln!(file, "[{stamp:>12.6}] {line}");
++        }
+     }
+     Ok(())
+ }
+diff --git a/crates/skyward-ui/src/surface.rs b/crates/skyward-ui/src/surface.rs
+index ab27c29..84306ff 100644
+--- a/crates/skyward-ui/src/surface.rs
++++ b/crates/skyward-ui/src/surface.rs
+@@ -305,6 +305,13 @@ pub mod kms {
+ 
+     fn open_card(path: &str) -> Result<Card> {
+         let file = OpenOptions::new().read(true).write(true).open(path).with_context(|| format!("open {path}"))?;
++        // A display some earlier process set up leaves this one a secondary
++        // client, and the kernel refuses a secondary client's commits; the
++        // bootloader's logo process is gone by now, so this either takes the
++        // role or is already the master. The bootloader leaves the panel lit
++        // either way.
++        const DRM_IOCTL_SET_MASTER: libc::c_ulong = 0x641e;
++        unsafe { libc::ioctl(file.as_raw_fd(), DRM_IOCTL_SET_MASTER as _) };
+         let card = Card(file);
+         card.set_client_capability(drm::ClientCapability::UniversalPlanes, true).context("enable universal planes")?;
+         card.set_client_capability(drm::ClientCapability::Atomic, true).context("enable atomic modesetting")?;
+@@ -522,17 +529,34 @@ pub mod kms {
+             let mut panel = None;
+             for &h in res.connectors() {
+                 let info = card.get_connector(h, true).context("read connector")?;
+-                if is_panel(info.interface()) && info.state() == connector::State::Connected {
++                if !is_panel(info.interface()) {
++                    continue;
++                }
++                if info.state() == connector::State::Connected {
+                     panel = Some(info);
+                     break;
+                 }
++                // A driver that has not settled the state yet still lists the
++                // modes the panel takes; keep it in case no connector says
++                // connected.
++                if panel.is_none() && !info.modes().is_empty() {
++                    panel = Some(info);
++                }
+             }
+             let conn = panel.ok_or_else(|| anyhow!("no connected built-in panel"))?;
++            // A driver that names no preferred mode still lists the modes the
++            // panel takes, and the largest is the one the panel is made for.
+             let preferred = conn
+                 .modes()
+                 .iter()
+                 .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+-                .ok_or_else(|| anyhow!("the panel reports no preferred mode"))?;
++                .or_else(|| {
++                    conn.modes().iter().max_by_key(|m| {
++                        let (w, h) = m.size();
++                        (u64::from(w) * u64::from(h), m.vrefresh())
++                    })
++                })
++                .ok_or_else(|| anyhow!("the panel reports no mode at all"))?;
+             // The fastest refresh at the preferred size, the first listed among
+             // equals: Android scrolls at it, and the 13 Ultra's touch reports
+             // come at the same 120 Hz.
+@@ -609,11 +633,15 @@ pub mod kms {
+             }
+             candidates.truncate(strips);
+ 
++            // Alpha first: MediaTek's mixers blend a plane that carries one,
++            // and a canvas's untouched pixels carry none, so the page would
++            // come out full of holes. Every pixel is written with all of
++            // its alpha below.
+             let pick = [
+-                (DrmFourcc::Xbgr8888, Order::Rgba),
+-                (DrmFourcc::Abgr8888, Order::Rgba),
+-                (DrmFourcc::Xrgb8888, Order::Bgra),
+                 (DrmFourcc::Argb8888, Order::Bgra),
++                (DrmFourcc::Xrgb8888, Order::Bgra),
++                (DrmFourcc::Abgr8888, Order::Rgba),
++                (DrmFourcc::Xbgr8888, Order::Rgba),
+             ];
+             let (fourcc, order) = pick
+                 .into_iter()
+@@ -696,6 +724,12 @@ pub mod kms {
+                 let fb_prop = props.handle("FB_ID")?;
+                 req.add_property(*plane, fb_prop, property::Value::Framebuffer(Some(bufs[0].fb)));
+                 req.add_property(*plane, props.handle("CRTC_ID")?, property::Value::CRTC(Some(crtc)));
++                // The page covers the panel whole and shows nothing
++                // through: a mixer left blending would take the canvas's
++                // untouched pixels for holes.
++                if let Ok((id, _)) = props.get("alpha") {
++                    req.add_property(*plane, id, property::Value::UnsignedRange(0xffff));
++                }
+                 req.add_property(*plane, props.handle("SRC_X")?, property::Value::UnsignedRange((x as u64) << 16));
+                 req.add_property(*plane, props.handle("SRC_Y")?, property::Value::UnsignedRange(0));
+                 req.add_property(*plane, props.handle("SRC_W")?, property::Value::UnsignedRange((strip as u64) << 16));
+@@ -868,10 +902,18 @@ pub mod kms {
+                 let src = &canvas.data[y * row..(y + 1) * row];
+                 let out = &mut dst[y * pitch..y * pitch + row];
+                 match order {
+-                    Order::Rgba => out.copy_from_slice(src),
++                    // Opaque either way: a canvas pixel nothing drew on
++                    // carries no alpha, and a mixer that blends would take
++                    // it for a hole in the page.
++                    Order::Rgba => {
++                        out.copy_from_slice(src);
++                        for px in out.as_chunks_mut::<4>().0 {
++                            px[3] = 255;
++                        }
++                    }
+                     Order::Bgra => {
+                         for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
+-                            *o = [s[2], s[1], s[0], s[3]];
++                            *o = [s[2], s[1], s[0], 255];
+                         }
+                     }
+                 }
+diff --git a/crates/skyward/src/main.rs b/crates/skyward/src/main.rs
+index 1a4c1f0..2b48d03 100644
+--- a/crates/skyward/src/main.rs
++++ b/crates/skyward/src/main.rs
+@@ -676,6 +676,14 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
+ /// kernel log and still end the process, which init then starts again.
+ fn recovery() -> Result<()> {
+     use std::os::unix::fs::PermissionsExt;
++    // A panic ends the process at once, and init starts it again at once:
++    // the phone would sit in a loop of half-started screens, with the port
++    // taken down each time round. The phone's own recovery, kept beside
++    // this one by the packer, takes the phone instead.
++    std::panic::set_hook(Box::new(|info| {
++        let _ = skyward_sys::kmsg(&format!("recovery panicked: {info}"));
++        to_phone_own("a panic");
++    }));
+     let run = || -> Result<()> {
+         // Open to the programs the recovery runs as other users, the
+         // supplicant among them, whatever the umask.
+@@ -683,12 +691,30 @@ fn recovery() -> Result<()> {
+         std::fs::set_permissions(skyward_sys::RUN, std::fs::Permissions::from_mode(0o755))
+             .with_context(|| format!("open {} to the recovery's other users", skyward_sys::RUN))?;
+         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
++        // The ramdisk's log goes with the next start, and a recovery whose
++        // screen or port did not come up leaves nothing else to read: the
++        // persist partition keeps a second copy for the boot after it.
++        if let Some(dir) = persist_dir() {
++            let log = dir.join("skyward.log");
++            if std::fs::metadata(&log).is_ok_and(|m| m.len() > (1 << 20)) {
++                let _ = std::fs::remove_file(&log);
++            }
++            let _ = skyward_sys::keep_log(&log);
++        }
+         // A recovery that ended with a function of its own in the port took
+         // the port with it; going through "none" takes that function off.
++        // The port is how a computer reaches the phone, and taking it down
++        // and up again is how it is put right, but a recovery with no port
++        // still works: nothing here ends the process, or a port that fails
++        // to come back would leave a phone with neither.
+         if skyward_sys::prop("sys.usb.state").is_some_and(|s| s != "adb") {
+-            skyward_sys::usb::set("none", std::time::Duration::from_secs(5))?;
++            if let Err(e) = skyward_sys::usb::set("none", std::time::Duration::from_secs(3)) {
++                let _ = skyward_sys::kmsg(&format!("usb: the port did not go to none: {e:#}"));
++            }
++        }
++        if let Err(e) = skyward_sys::set_prop("sys.usb.config", "adb") {
++            let _ = skyward_sys::kmsg(&format!("usb: adb was not asked for: {e:#}"));
+         }
+-        skyward_sys::set_prop("sys.usb.config", "adb")?;
+         let misc = bcb::misc();
+         let message = bcb::read(&misc)?;
+         let request = message.request();
+@@ -748,7 +774,14 @@ fn recovery() -> Result<()> {
+             // erasing them, which may take super with them, and undoing
+             // shared blocks, which writes to the slot's own.
+             if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
+-                prepare(&cfg, booted_slot()?)?;
++                // The screen and the keys work without the slot's
++                // partitions, so not knowing which slot runs ends nothing.
++                match booted_slot() {
++                    Ok(slot) => prepare(&cfg, slot)?,
++                    Err(e) => {
++                        let _ = skyward_sys::kmsg(&format!("slot not read: {e:#}"));
++                    }
++                }
+             }
+             let root = Path::new("/");
+             ui::run(&cfg, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None)
+@@ -758,9 +791,54 @@ fn recovery() -> Result<()> {
+             anyhow::bail!("the recovery service runs only on Android")
+         }
+     };
+-    run().inspect_err(|e| {
+-        let _ = skyward_sys::kmsg(&format!("recovery failed: {e:#}"));
+-    })
++    match run() {
++        Ok(()) => Ok(()),
++        Err(e) => {
++            let _ = skyward_sys::kmsg(&format!("recovery failed: {e:#}"));
++            to_phone_own(&format!("{e:#}"))
++        }
++    }
++}
++
++/// The folder the phone's persist partition is mounted at, mounting it
++/// where nothing has yet. What is written there outlives the start, which
++/// the ramdisk and the kernel log do not.
++#[cfg(target_os = "android")]
++fn persist_dir() -> Option<PathBuf> {
++    const DIR: &str = "/mnt/vendor/persist";
++    const DEVICE: &str = "/dev/block/by-name/persist";
++    if Path::new("/persist").join("sensors").exists() {
++        return Some(PathBuf::from("/persist"));
++    }
++    if !Path::new(DEVICE).exists() {
++        return None;
++    }
++    let _ = std::fs::create_dir_all(DIR);
++    // Already mounted answers busy, which is just as good.
++    let c = |s: &str| std::ffi::CString::new(s).ok();
++    if let (Some(src), Some(dst), Some(ty)) = (c(DEVICE), c(DIR), c("ext4")) {
++        unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), 0, std::ptr::null()) };
++    }
++    Some(PathBuf::from(DIR))
++}
++
++#[cfg(not(target_os = "android"))]
++fn persist_dir() -> Option<PathBuf> {
++    None
++}
++
++/// Start the phone's own recovery, which the packer keeps beside this one,
++/// in place of this process. A phone whose recovery cannot come up is then
++/// still a recovery: its own, with the port that one opens.
++fn to_phone_own(why: &str) -> ! {
++    const STOCK: &str = "/system/bin/recovery.stock";
++    if Path::new(STOCK).exists() {
++        let _ = skyward_sys::kmsg(&format!("handing the phone over to {STOCK}: {why}"));
++        use std::os::unix::process::CommandExt;
++        let err = std::process::Command::new(STOCK).exec();
++        let _ = skyward_sys::kmsg(&format!("{STOCK} did not start: {err}"));
++    }
++    std::process::exit(1)
+ }
+ 
+ /// Map and mount the slot's partitions from super, then bring up what runs
+diff --git a/crates/skyward/src/ui.rs b/crates/skyward/src/ui.rs
+index 3144b83..b09765f 100644
+--- a/crates/skyward/src/ui.rs
++++ b/crates/skyward/src/ui.rs
+@@ -80,7 +80,12 @@ const STORAGE_LOGS: &str = "Skyward/logs";
+ const SCREENSHOTS: &str = "DCIM/Screenshots";
+ const HELD_SCREENSHOTS: &str = "/skyward/run/screenshots";
+ 
+-/// The panel backlight under /sys/class/backlight.
++/// Where a panel's backlight may live: Qualcomm and most panels register
++/// one under /sys/class/backlight, while a MediaTek LCD backlight often
++/// shows up as one of the LEDs instead.
++const BACKLIGHT_DIRS: [&str; 2] = ["/sys/class/backlight", "/sys/class/leds"];
++
++/// The panel backlight under /sys/class/backlight or /sys/class/leds.
+ struct Backlight {
+     path: PathBuf,
+     /// The raw level at the top of the slider: the panel's normal maximum.
+@@ -91,17 +96,34 @@ struct Backlight {
+ 
+ impl Backlight {
+     fn open() -> Result<Self> {
+-        let mut dirs: Vec<PathBuf> = fs::read_dir("/sys/class/backlight")
+-            .context("read /sys/class/backlight")?
+-            .map(|e| e.map(|e| e.path()))
+-            .collect::<std::io::Result<_>>()?;
++        let mut dirs: Vec<PathBuf> = Vec::new();
++        for base in BACKLIGHT_DIRS {
++            // A phone without the class at all simply has none there.
++            let Ok(entries) = fs::read_dir(base) else { continue };
++            for path in entries.flatten().map(|e| e.path()) {
++                if !path.join("brightness").exists() || !path.join("max_brightness").exists() {
++                    continue;
++                }
++                // The LED class also holds the notification light and the
++                // button lights, which the screen does not follow.
++                if base == "/sys/class/leds" {
++                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
++                    if !name.contains("backlight") && !name.contains("lcd") {
++                        continue;
++                    }
++                }
++                dirs.push(path);
++            }
++        }
+         dirs.sort();
+-        // Qualcomm panels expose panel0-backlight; take it when present.
++        // Qualcomm panels expose panel0-backlight, MediaTek's LCD one
++        // lcd-backlight; take either when present.
+         let dir = dirs
+             .iter()
+             .find(|d| d.file_name().is_some_and(|n| n == "panel0-backlight"))
++            .or_else(|| dirs.iter().find(|d| d.file_name().is_some_and(|n| n == "lcd-backlight")))
+             .or(dirs.first())
+-            .ok_or_else(|| anyhow!("no backlight device"))?
++            .ok_or_else(|| anyhow!("no backlight device under /sys/class/backlight or /sys/class/leds"))?
+             .clone();
+         let read = |name: &str| -> Result<u32> {
+             fs::read_to_string(dir.join(name))
+@@ -1043,6 +1065,23 @@ fn wait(fds: &[i32], timeout_ms: i32) -> Result<()> {
+     Ok(())
+ }
+ 
++/// Hand over to the recovery the ramdisk came with when the screen Skyward
++/// drives cannot come on. The packer keeps that binary beside Skyward's for
++/// exactly this, so a phone whose display Skyward cannot use still shows a
++/// recovery rather than a dark screen.
++fn stock_recovery(why: &anyhow::Error) -> Result<()> {
++    const STOCK: &str = "/system/bin/recovery.stock";
++    let _ = skyward_sys::kmsg(&format!("display: {why:#}"));
++    if !Path::new(STOCK).exists() {
++        return Err(anyhow!("{why:#}"));
++    }
++    let _ = skyward_sys::kmsg(&format!("starting the stock recovery at {STOCK}"));
++    use std::os::unix::process::CommandExt;
++    let err = std::process::Command::new(STOCK).exec();
++    let _ = skyward_sys::kmsg(&format!("the stock recovery did not start: {err}"));
++    Err(anyhow!("{why:#}"))
++}
++
+ /// Run the pages. What `request`, read from misc, asks for decides the
+ /// first of them; asking for nothing, they start at `start`.
+ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
+@@ -1051,16 +1090,44 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+     }
+     let mut info = skyward_info::collect(cfg)?;
+     let fonts = Fonts::load(font, 0, mono)?;
+-    let mut surface = KmsSurface::open("/dev/dri/card0")?;
++    // The screen comes first: a recovery whose screen cannot come on is no
++    // recovery at all, so the reason goes to the kernel log and the phone's
++    // own recovery, which the packer keeps beside Skyward's, takes over.
++    let mut surface = match KmsSurface::open("/dev/dri/card0") {
++        Ok(surface) => surface,
++        Err(e) => return stock_recovery(&e),
++    };
+     let (w, h) = surface.size();
+-    eprintln!("display {}", surface.describe());
+-    let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
++    let _ = skyward_sys::kmsg(&format!("display: {}", surface.describe()));
++    // The touch panel and the keys are how the pages are worked, so without
++    // them there is nothing to do but say why.
++    let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone()).inspect_err(|e| {
++        let _ = skyward_sys::kmsg(&format!("touch and keys: {e:#}"));
++    })?;
+     let started = Instant::now();
+     let mut touch_known = false;
+-    // adbd and fastbootd ask over it to go over to fastboot and back.
+-    let control = Control::open()?;
+-    let mut haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
+-    let mut backlight = Backlight::open()?;
++    // adbd and fastbootd ask over it to go over to fastboot and back, and a
++    // phone whose init opened no such socket still shows its pages.
++    let control = Control::open().unwrap_or_else(|e| {
++        let _ = skyward_sys::kmsg(&format!("recovery socket: {e:#}"));
++        None
++    });
++    let mut haptics = cfg.haptics.as_ref().and_then(|c| match Haptics::open(c) {
++        Ok(haptics) => Some(haptics),
++        Err(e) => {
++            let _ = skyward_sys::kmsg(&format!("vibrator: {e:#}"));
++            None
++        }
++    });
++    // A panel whose backlight lives nowhere the recovery can write still
++    // scans out what it is sent, lit at whatever the bootloader left.
++    let mut backlight = match Backlight::open() {
++        Ok(backlight) => Some(backlight),
++        Err(e) => {
++            let _ = skyward_sys::kmsg(&format!("backlight: {e:#}"));
++            None
++        }
++    };
+     let first = match &request.work {
+         Work::Fastboot => Screen::Fastboot,
+         Work::PromptWipeData => Screen::CantStart,
+@@ -1465,11 +1532,16 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+         }
+         // After the frame is on the panel, so a panel coming back on lights
+         // with what it should show now, never with what it showed when it
+-        // went off.
+-        if backlight.level == 0 && panel.is_some() {
++        // went off. A panel with no backlight of its own is left lit.
++        let dark = backlight.as_ref().is_some_and(|b| b.level == 0);
++        if dark && panel.is_some() {
+             surface.settle()?;
+         }
+-        backlight.show(panel)?;
++        if let Some(backlight) = &mut backlight {
++            // A backlight that refuses the write leaves the panel lit at the
++            // level it had rather than take the screen down with it.
++            let _ = backlight.show(panel);
++        }
+         if panel.is_some() {
+             // Lit, a panel that came on again switches to its fastest
+             // refresh.
+diff --git a/devices/pickle.toml b/devices/pickle.toml
+new file mode 100644
+index 0000000..94cffae
+--- /dev/null
++++ b/devices/pickle.toml
+@@ -0,0 +1,203 @@
++# Skyward 设备配置 —— OnePlus Ace（pickle / PGKM10）
++#
++# 数据来源：原厂 ColorOS 12.1（SP1A.210812.016，ro.oplus.version.base
++# 00.4.00015003.2026040318171036965716）恢复模式的 vendor_boot 镜像
++# vendor_boot_20261111_203114.img（VNDRBOOT v4，64 MiB 分区 dump，含 AVB 尾巴）。
++# 文中「原厂包」均指该镜像解出的 ramdisk。
++#
++# 关键前提：这台机器把 recovery 的根文件系统放在 vendor_boot 里（MTK GKI 布局），
++# 而不是独立的 recovery 分区。证据：ramdisk 内有 init.recovery.mt6895.rc、
++# system/bin/recovery、system/bin/phoenix_recovery、res/OplusOS，且
++# system/etc/init/hw/init.rc 第一行就是 import /init.recovery.${ro.board.platform}.rc。
++# skyward-pack 现在认 VNDRBOOT v4：读到这个头就按 vendor_boot 打包——头、ramdisk
++# 表里的每一个片段、dtbo 段原样保留，换掉装着 recovery 的那一段，再按分区大小
++# 补 AVB 尾巴（见 crates/skyward-bootimg/src/vendorboot.rs）。
++#
++# 本文件里 TODO 的字段，仍需真机或 vendor / vendor_dlkm 分区确认。
++
++[device]
++codename = "pickle"
++brand = "OnePlus"
++model = "OnePlus Ace"
++ab = true
++soc = { hans = "天玑8100-Max移动平台", hant = "天璣8100-Max行動平台", en = "MediaTek Dimensity 8100-Max" }
++# ColorOS 的版本属性。原厂 prop.default 里能看到的只有 ro.oplus.version.base，
++# 若真机上没有 ro.build.version.ota，退回前者。
++os_version_prop = "ro.build.version.ota"
++
++[display]
++width = 1080
++height = 2412
++density = 480        # 原厂 prop.default：ro.sf.lcd_density=480
++diagonal = 6.7
++corner_radius = 0    # TODO 需系统 overlay（DevicesAndroidOverlay）确认，非 0 才要填
++
++[modules]
++sources = ["vendor_boot", "vendor_dlkm", "vendor"]
++# 取自原厂 lib/modules/modules.load.recovery（246 个模块）中显示、触摸、振动部分，
++# 顺序也照它排。依赖由 modules.dep 自动带出（原厂包内有 modules.dep / alias /
++# softdep / load / load.recovery 全套）。
++# 面板驱动照原厂做法全部加载：同一份 vendor_boot 供 ossi 统一包下的多个项目用，
++# 只有实际接上的那颗面板会 probe 成功。
++load = [
++    # 显示：MTK DRM + 面板扩展；面板本体（21641/21861 两组，BOE / 天马）
++    "mtk_panel_ext",
++    "mediatek-drm",   # 文件名带连字符，Skyward 按 "{name}.ko" 找文件，不能写成 mediatek_drm
++    "oplus21641_boe_nt37701_fhd_dsi_cmd",
++    "oplus21641_boe_nt37701a_fhd_dsi_cmd",
++    "oplus21641_tianma_ili7838a_fhd_dsi_cmd",
++    "oplus21861_boe_nt37701a_fhd_dsi_cmd",
++    "oplus21861_tianma_ili7838a_fhd_dsi_cmd",
++    # 触摸：FocalTech FT3683G，原厂按 common → IC → 驱动 三段加载
++    # （触摸工程 omega-c2，面板 alias AC157，固件在 /vendor/firmware/tp/omega-c2）
++    "oplus_bsp_tp_ft3683g",
++    "oplus_ft3683g",
++    # 振动：Awinic AW8697
++    "aw8697",
++    # 电量：MT6375 电池 + OPLUS 充电栈（关于页读电量要用）
++    # 同样注意文件名带连字符：mt6375-battery.ko
++    "mt6375-battery",
++    "oplus_chg_v2",
++]
++
++# 触摸控制器 FT3683G 由内核 input 子系统直接出 /dev/input/eventX，
++# 原厂没有像小米那样再起一个用户态触摸服务，也不需要在读出触摸前写 sysfs。
++[touch]
++
++[backup]
++# MTK 的基带 / IMEI 与校准数据：nvram 与 nvdata 是 IMEI 与射频校准，
++# nvcfg 是配置，protect1/protect2 是出厂保护分区，seccfg 是锁状态，
++# persist 存传感器校准，proinfo 存产品信息（见原厂 recovery.fstab）。
++efs = ["nvram", "nvdata", "nvcfg", "protect1", "protect2", "seccfg", "persist", "proinfo"]
++# TODO 确认 secure world（Trustonic TEE）在 /data 下自管的目录，
++# 常见候选：vendor/tee、vendor/tzstorage、vendor/fingerprint。
++data_skipped = []
++
++[wipe]
++# ColorOS 的日志目录（原厂 recovery 二进制里写死的路径），只清文件、留目录。
++logs = ["/data/oppo_log"]
++# TODO 真机确认是否还有 /data/aee_exp（MTK AEE 转储）与 /data/vendor/ramdump。
++
++# ============================================================================
++# 以下按原厂 vendor / vendor_dlkm 分区（vendor.img、vendor_dlkm_b.img）核对填写。
++# ============================================================================
++
++# Trustonic 的 TEE 守护进程要读 /mnt/vendor/persist/mcRegistry，而 recover
++# 的 fstab（recovery.fstab）里没有 persist，原厂只在 first-stage 的
++# fstab.mt6895 里登记了它，所以 persist 要由 Skyward 自己挂。
++# vendor 与 odm 带 first_stage_mount，原厂 init 起来时已挂好，这里不再重复。
++[partitions]
++mounted = ["persist"]
++
++# WLAN：MT6895 是 connac2 方案，驱动在 vendor_dlkm
++# （conninfra → wlan_drv_gen4m_6895），芯片上电靠写 /dev/wmtWifi
++# （wmt_chrdev_wifi_connac2 建的字符设备，libwifi-hal.so 也是这么做的）。
++# 原厂 supplicant 的参数：-O/data/vendor/wifi/wpa/sockets -g@android:wpa_wlan0
++[wlan]
++modules = ["conninfra", "wlan_drv_gen4m_6895"]
++writes = [{ path = "/dev/wmtWifi", value = "1" }]
++interface = "wlan0"
++supplicant = "/vendor/bin/hw/wpa_supplicant"
++libraries = ["/vendor/lib64", "/system/lib64"]
++service = "android.hardware.wifi.supplicant@1.0::ISupplicant/default"
++# 原厂用 https://connectivitycheck.gstatic.com/generate_204（另有 www.google.cn），
++# Skyward 这一项按纯 HTTP 用。
++probe = "http://connectivitycheck.gstatic.com/generate_204"
++
++# 振动器：aw8697 + haptic_hv。该驱动不对外暴露共振频率（f0 只在驱动内部标定），
++# 因此 Skyward 的 [haptics] 段（需要 resonance 文件）暂时填不了。
++# [haptics]
++# resonance = "/sys/class/haptic_hv/f0"
++# strength = { lightest = 0.5, strongest = 1.0 }
++
++# 更新服务器：OPPO/一加 的 OTA 查询接口，需抓包确认
++# [update]
++# server = ""
++
++# 解密链路（顺序即启动顺序）：
++#   hwservicemanager → Trustonic 守护进程 → keymint（AIDL）→ gatekeeper（HIDL）
++# 全部取自原厂 /vendor/etc/init/*.rc。keymint 是 AIDL（NDK backend），
++# 实例名 IKeyMintDevice/default；gatekeeper 是 HIDL 1.0。
++[[service]]
++path = "/system/bin/hwservicemanager"
++libraries = ["/system/lib64", "/vendor/lib64"]
++ready_property = "hwservicemanager.ready"
++user = "system"
++groups = ["system", "readproc"]
++
++# 原厂：/vendor/bin/mcDriverDaemon --sfs-reformat --P1 /mnt/vendor/persist/mcRegistry -r …
++# 这里去掉了 --sfs-reformat：那是正常开机时重建 TEE 安全文件系统用的，
++# 在恢复模式里跑有清掉 keystore / gatekeeper 状态的风险。
++[[service]]
++path = "/vendor/bin/mcDriverDaemon"
++args = [
++    "--P1", "/mnt/vendor/persist/mcRegistry",
++    "-r", "/vendor/app/mcRegistry/06090000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/020f0000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/05120000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/05120000000000000000000000000001.drbin",
++    "-r", "/vendor/app/mcRegistry/05160000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/020b0000000000000000000000000000.drbin",
++    "-r", "/odm/vendor/app/mcRegistry/05070000000000000000000000000000.drbin",
++    "-r", "/odm/vendor/app/mcRegistry/030b0000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/03100000000000000000000000000000.drbin",
++    "-r", "/odm/vendor/app/mcRegistry/030c0000000000000000000000000000.drbin",
++    "-r", "/odm/vendor/app/mcRegistry/031c0000000000000000000000000000.drbin",
++    "-r", "/odm/vendor/app/mcRegistry/033c0000000000000000000000000000.drbin",
++    "-r", "/odm/vendor/app/mcRegistry/035c0000000000000000000000000000.drbin",
++    "-r", "/odm/vendor/app/mcRegistry/037c0000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/031c0000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/032c0000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/033c0000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/034c0000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/035c0000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/036c0000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/037c0000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/40188311faf343488db888ad39496f9a.drbin",
++    "-r", "/vendor/app/mcRegistry/090b0000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/0f5eed3c3b5a47afacca69a84bf0efad.drbin",
++    "-r", "/vendor/app/mcRegistry/07060000000000000000000000007169.drbin",
++    "-r", "/vendor/app/mcRegistry/4be4f7dc1f2c11e5b5f7727283247c7f.drbin",
++    "-r", "/vendor/app/mcRegistry/08070000000000000000000000008270.drbin",
++    "-r", "/vendor/app/mcRegistry/07070000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/07407000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/9073f03a9618383bb1856eb3f990babd.drbin",
++    "-r", "/odm/vendor/app/mcRegistry/6b3f5fa0f8cf55a7be2582587d62d63a.drbin",
++    "-r", "/odm/vendor/app/mcRegistry/09070000000000000000000000000000.drbin",
++    "-r", "/vendor/app/mcRegistry/5020170115e016302017012521300000.drbin",
++]
++user = "system"
++groups = ["system"]
++
++# Trustonic 的 keymint：AIDL（ndk backend），原厂 rc 里 class early_hal、user system
++[[service]]
++path = "/vendor/bin/hw/android.hardware.security.keymint-service.trustonic"
++libraries = ["/system/lib64", "/vendor/lib64"]
++ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
++registers = ["android.hardware.security.keymint.IRemotelyProvisionedComponent/default"]
++user = "system"
++groups = ["system"]
++
++# gatekeeper：HIDL 1.0，原厂 rc 里 user system / group system
++[[service]]
++path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service"
++libraries = ["/system/lib64", "/vendor/lib64"]
++ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
++user = "system"
++groups = ["system"]
++
++# 原厂 ramdisk 自带的那份 boot control（HIDL 1.2），写当前槽位用
++[[service]]
++path = "/vendor/bin/hw/android.hardware.boot@1.2-service"
++libraries = ["/system/lib64", "/vendor/lib64"]
++ready_hardware_service = "android.hardware.boot@1.2::IBootControl/default"
++user = "root"
++groups = ["root"]
++
++
++# 原厂构建：Skyward 要以原厂包为底改。本机恢复镜像就是 vendor_boot，
++# 下面给出这个 dump 的版本与 SHA-256；换成 OTA 包里的 vendor_boot.img 时需重算。
++# [stock]
++# version = "00.4.00015003.2026040318171036965716"   # ro.oplus.version.base
++# package = ""                                        # TODO 原厂完整 OTA 包地址
++# recovery = "bb5a094de2f3396b9be3b20354d637092ef57d1355413b784cd863f222839670"
