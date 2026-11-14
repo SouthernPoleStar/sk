@@ -315,9 +315,29 @@ const TASK_PROFILES: &[u8] = include_bytes!("task_profiles.json");
 /// stock recovery does not offer.
 const MTP_RC: &[u8] = include_bytes!("mtp.rc");
 
+/// The rules Skyward adds past the ramdisk's own.
+///
+/// The phone's own recovery is kept at a path of ours, and init labels it
+/// from the ramdisk's file contexts unless told otherwise; the label every
+/// other program under `/system` has is the one the recovery domain is
+/// allowed to run, so it is set before Skyward hands the phone over.
+///
+/// adb is started from a rule of our own as well: a stock recovery starts
+/// it only when the build it was made on is a debuggable one, and on a
+/// phone whose `ro.debuggable` a later property file puts back to 0 the
+/// port is then never opened, leaving a recovery with no way to be read.
+const INIT_ADDITIONS: &str = "\n\
+on post-fs\n\
+    chcon u:object_r:system_file:s0 /system/bin/recovery.stock\n\
+\n\
+on boot\n\
+    setprop sys.usb.config adb\n\
+    start adbd\n";
+
 /// Declare the recovery service as one init starts once, in whichever of
 /// the ramdisk's own init rules declares it. A stock one declares it
-/// without `oneshot`, so init starts it again as soon as it ends.
+/// without `oneshot`, so init starts it again as soon as it ends. The
+/// rules above are appended past them.
 fn once(rd: &mut Ramdisk) -> Result<()> {
     for path in INIT_RC {
         let Some(entry) = rd.find(path) else { continue };
@@ -339,6 +359,7 @@ fn once(rd: &mut Ramdisk) -> Result<()> {
                 ours = false;
             }
         }
+        out.push_str(INIT_ADDITIONS);
         rd.replace(path, out.into_bytes())?;
         return Ok(());
     }
